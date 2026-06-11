@@ -1,111 +1,111 @@
 import os
+import torch
 from torchvision import transforms
-from utils import *
 from PIL import Image, ImageDraw, ImageFont
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from model import SSD300
+from utils import rev_label_map, label_color_map
 
 # ── Split and checkpoint to use for detection ──────────────────────────
 SPLIT = 'split_005'
-EPOCH = None  # None = best checkpoint; set to epoch number for a periodic snapshot
+EPOCH = None  # None = best checkpoint; integer = periodic snapshot (e.g. 100)
 # ────────────────────────────────────────────────────────────────────────
 
-if EPOCH is None:
-    checkpoint_path = os.path.join('checkpoints', SPLIT, 'checkpoint_best.pth.tar')
-else:
-    checkpoint_path = os.path.join('checkpoints', SPLIT, f'checkpoint_epoch_{EPOCH:04d}.pth.tar')
-
-checkpoint = torch.load(checkpoint_path, map_location=device)
-print('\nLoaded checkpoint from epoch %d.\n' % checkpoint['epoch'])
-model = checkpoint['model']
-model = model.to(device)
-model.eval()
-
-# Transforms
-resize = transforms.Resize((300, 300))
-to_tensor = transforms.ToTensor()
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def detect(original_image, min_score, max_overlap, top_k, suppress=None):
+def resolve_checkpoint():
+    if EPOCH is None:
+        return os.path.join('checkpoints', SPLIT, 'checkpoint_best.pth.tar')
+    return os.path.join('checkpoints', SPLIT, f'checkpoint_epoch_{EPOCH:04d}.pth.tar')
+
+
+def detect(model, original_image, min_score, max_overlap, top_k, suppress=None):
     """
-    Detect objects in an image with a trained SSD300, and visualize the results.
+    Detect objects in an image with a trained SSD300 and return an annotated PIL image.
 
-    :param original_image: image, a PIL Image
-    :param min_score: minimum threshold for a detected box to be considered a match for a certain class
-    :param max_overlap: maximum overlap two boxes can have so that the one with the lower score is not suppressed via Non-Maximum Suppression (NMS)
-    :param top_k: if there are a lot of resulting detection across all classes, keep only the top 'k'
-    :param suppress: classes that you know for sure cannot be in the image or you do not want in the image, a list
-    :return: annotated image, a PIL Image
+    :param model: trained SSD300 in eval mode
+    :param original_image: PIL Image
+    :param min_score: minimum confidence threshold to keep a detection
+    :param max_overlap: NMS IoU threshold
+    :param top_k: maximum detections to keep per image
+    :param suppress: list of class names to ignore in the output
+    :return: annotated PIL Image
     """
+    resize    = transforms.Resize((300, 300))
+    to_tensor = transforms.ToTensor()
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
 
-    # Transform
-    image = normalize(to_tensor(resize(original_image)))
+    image = normalize(to_tensor(resize(original_image))).to(device)
 
-    # Move to default device
-    image = image.to(device)
-
-    # Forward prop.
     predicted_locs, predicted_scores = model(image.unsqueeze(0))
 
-    # Detect objects in SSD output
-    det_boxes, det_labels, det_scores = model.detect_objects(predicted_locs, predicted_scores, min_score=min_score,
-                                                             max_overlap=max_overlap, top_k=top_k)
+    det_boxes, det_labels, det_scores = model.detect_objects(
+        predicted_locs, predicted_scores,
+        min_score=min_score, max_overlap=max_overlap, top_k=top_k
+    )
 
-    # Move detections to the CPU
-    det_boxes = det_boxes[0].to('cpu')
-
-    # Transform to original image dimensions
-    original_dims = torch.FloatTensor(
-        [original_image.width, original_image.height, original_image.width, original_image.height]).unsqueeze(0)
-    det_boxes = det_boxes * original_dims
-
-    # Decode class integer labels
+    det_boxes  = det_boxes[0].to('cpu')
     det_labels = [rev_label_map[l] for l in det_labels[0].to('cpu').tolist()]
 
-    # If no objects found, the detected labels will be set to ['0.'], i.e. ['background'] in SSD300.detect_objects() in model.py
     if det_labels == ['background']:
-        # Just return original image
         return original_image
 
-    # Annotate
-    annotated_image = original_image
+    # Scale fractional box coords back to original image pixels
+    original_dims = torch.FloatTensor(
+        [original_image.width, original_image.height,
+         original_image.width, original_image.height]
+    ).unsqueeze(0)
+    det_boxes = det_boxes * original_dims
+
+    annotated_image = original_image.copy()
     draw = ImageDraw.Draw(annotated_image)
     font = ImageFont.truetype("./calibril.ttf", 15)
 
-    # Suppress specific classes, if needed
     for i in range(det_boxes.size(0)):
-        if suppress is not None:
-            if det_labels[i] in suppress:
-                continue
+        if suppress is not None and det_labels[i] in suppress:
+            continue
 
-        # Boxes
         box_location = det_boxes[i].tolist()
         draw.rectangle(xy=box_location, outline=label_color_map[det_labels[i]])
-        draw.rectangle(xy=[l + 1. for l in box_location], outline=label_color_map[
-            det_labels[i]])  # a second rectangle at an offset of 1 pixel to increase line thickness
-        # draw.rectangle(xy=[l + 2. for l in box_location], outline=label_color_map[
-        #     det_labels[i]])  # a third rectangle at an offset of 1 pixel to increase line thickness
-        # draw.rectangle(xy=[l + 3. for l in box_location], outline=label_color_map[
-        #     det_labels[i]])  # a fourth rectangle at an offset of 1 pixel to increase line thickness
+        # Second rectangle offset by 1 pixel to thicken the border
+        draw.rectangle(xy=[l + 1. for l in box_location], outline=label_color_map[det_labels[i]])
 
-        # Text — use getbbox() instead of getsize() which was removed in Pillow 10+
-        bbox = font.getbbox(det_labels[i].upper())
+        # Text label — use getbbox() (Pillow 10+ compatible)
+        bbox      = font.getbbox(det_labels[i].upper())
         text_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
-        text_location = [box_location[0] + 2., box_location[1] - text_size[1]]
-        textbox_location = [box_location[0], box_location[1] - text_size[1], box_location[0] + text_size[0] + 4.,
-                            box_location[1]]
+        text_location   = [box_location[0] + 2., box_location[1] - text_size[1]]
+        textbox_location = [box_location[0], box_location[1] - text_size[1],
+                            box_location[0] + text_size[0] + 4., box_location[1]]
         draw.rectangle(xy=textbox_location, fill=label_color_map[det_labels[i]])
-        draw.text(xy=text_location, text=det_labels[i].upper(), fill='white',
-                  font=font)
-    del draw
+        draw.text(xy=text_location, text=det_labels[i].upper(), fill='white', font=font)
 
+    del draw
     return annotated_image
 
 
+def main():
+    ckpt_path = resolve_checkpoint()
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}\n"
+                                f"Run train.py first, or set EPOCH to an available snapshot.")
+
+    print(f'Loading checkpoint: {ckpt_path}')
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model = SSD300(n_classes=ckpt['n_classes'])
+    model.load_state_dict(ckpt['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    print(f'Loaded checkpoint from epoch {ckpt["epoch"]}.\n')
+
+    img_path = os.path.join('..', 'data', 'JPEGImages-test', '00001.jpg')
+    original_image = Image.open(img_path).convert('RGB')
+
+    result = detect(model, original_image, min_score=0.2, max_overlap=0.5, top_k=200)
+    result.show()
+
+
 if __name__ == '__main__':
-    img_path = os.path.join('..', 'JPEGImages-test', '00001.jpg')
-    original_image = Image.open(img_path, mode='r')
-    original_image = original_image.convert('RGB')
-    detect(original_image, min_score=0.2, max_overlap=0.5, top_k=200).show()
+    main()

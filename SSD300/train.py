@@ -17,33 +17,31 @@ SPLIT = 'split_005'  # options: split_005, split_025, split_050, split_075, spli
 MAX_EPOCHS   = 500    # safety ceiling — early stopping will trigger well before this
 WARMUP_ITERS = 500    # linearly ramp lr from ~0 to lr over first 500 iterations
 PATIENCE     = 10     # stop training if val loss doesn't improve for this many epochs
-MIN_DELTA    = 0.01   # minimum improvement in val loss to count as progress (SSD loss is in range 1–10; 0.001 was below noise floor)
+MIN_DELTA    = 0.01   # minimum improvement in val loss to count as progress
 LR_PATIENCE  = 5      # reduce lr if val loss doesn't improve for this many epochs
 # ──────────────────────────────────────────────────────────────────────
 
 # Data parameters
-DATA_DIR   = os.path.join(os.path.dirname(__file__), '..')
-SPLIT_FILE = os.path.join(os.path.dirname(__file__), '..', 'Python_datareader', f'{SPLIT}_indices.npy')
+DATA_DIR   = os.path.join(os.path.dirname(__file__), '..', 'data')
+SPLIT_FILE = os.path.join(os.path.dirname(__file__), '..', 'data', 'Python_datareader', f'{SPLIT}_indices.npy')
 
 # generate_splits.py built indices over the full trainval pool (11,725 IDs).
-# Roughly half of those indices point to val.txt images — using them for
-# training causes data leakage.  We keep only indices < TRAIN_SIZE so the
-# training set draws exclusively from train.txt.
-TRAIN_SIZE = 5862   # number of lines in Main/train.txt
-_raw_indices   = np.load(SPLIT_FILE)
-TRAIN_INDICES  = _raw_indices[_raw_indices < TRAIN_SIZE]   # numpy array, passed directly to DIORDatasetSSD
+# We keep only indices < TRAIN_SIZE so the training set draws exclusively
+# from train.txt (prevents data leakage from val.txt images).
+TRAIN_SIZE    = 5862
+_raw_indices  = np.load(SPLIT_FILE)
+TRAIN_INDICES = _raw_indices[_raw_indices < TRAIN_SIZE]
 
 # Model parameters
 n_classes = len(label_map)  # 21 (20 DIOR classes + background)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Learning parameters
-checkpoint   = None   # path to checkpoint to resume from, None to start fresh
-batch_size   = 8      # batch size
-workers      = 4      # number of workers for loading data in the DataLoader
-lr           = 1e-3   # learning rate
-momentum     = 0.9    # momentum
-weight_decay = 5e-4   # weight decay
+batch_size   = 8
+workers      = 4
+lr           = 1e-3
+momentum     = 0.9
+weight_decay = 5e-4
 grad_clip    = 4.0    # clip gradients — protects against explosion from randomly-init heads early in training
 
 cudnn.benchmark = True
@@ -56,72 +54,58 @@ def _set_bn_eval(module):
 
 
 def main():
-    """
-    Training with early stopping and ReduceLROnPlateau scheduler.
-    """
-    global start_epoch, label_map, epoch, checkpoint
-
-    # best_val_loss tracks the lowest val loss seen — used for early stopping
-    # and to decide when to save checkpoint_best
     best_val_loss    = float('inf')
-    epochs_no_improve = 0  # counter — resets to 0 whenever val loss improves
+    epochs_no_improve = 0
 
-    # ── Initialize model or load checkpoint ───────────────────────────
-    if checkpoint is None:
-        start_epoch = 0
-        model = SSD300(n_classes=n_classes)
+    # ── Build model and optimizer (always, so structure is identical on resume) ──
+    model = SSD300(n_classes=n_classes)
 
-        # Differential LR: pretrained backbone gets 10x lower LR than the
-        # randomly-initialised auxiliary and prediction heads.  Biases always
-        # get 2x their group's base LR (standard SSD practice).
-        bb_w, bb_b, head_w, head_b = [], [], [], []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            is_bias     = name.endswith('.bias')
-            is_backbone = name.startswith('base.')
-            if is_backbone:
-                (bb_b   if is_bias else bb_w).append(param)
-            else:
-                (head_b if is_bias else head_w).append(param)
+    # Differential LR: pretrained backbone gets 10x lower LR than the
+    # randomly-initialised auxiliary and prediction heads.  Biases always
+    # get 2x their group's base LR (standard SSD practice).
+    bb_w, bb_b, head_w, head_b = [], [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_bias     = name.endswith('.bias')
+        is_backbone = name.startswith('base.')
+        if is_backbone:
+            (bb_b   if is_bias else bb_w).append(param)
+        else:
+            (head_b if is_bias else head_w).append(param)
 
-        optimizer = torch.optim.SGD(
-            params=[
-                {'params': bb_w,   'lr': lr * 0.1},        # backbone weights
-                {'params': bb_b,   'lr': lr * 0.1 * 2},    # backbone biases
-                {'params': head_w, 'lr': lr},               # head weights
-                {'params': head_b, 'lr': lr * 2},           # head biases
-            ],
-            momentum=momentum, weight_decay=weight_decay
-        )
+    optimizer = torch.optim.SGD(
+        params=[
+            {'params': bb_w,   'lr': lr * 0.1},        # backbone weights
+            {'params': bb_b,   'lr': lr * 0.1 * 2},    # backbone biases
+            {'params': head_w, 'lr': lr},               # head weights
+            {'params': head_b, 'lr': lr * 2},           # head biases
+        ],
+        momentum=momentum, weight_decay=weight_decay
+    )
 
+    # ── Auto-resume from latest checkpoint if one exists ─────────────────
+    auto_ckpt = os.path.join('checkpoints', SPLIT, 'checkpoint_latest.pth.tar')
+    if os.path.exists(auto_ckpt):
+        print(f'\nAuto-resuming from {auto_ckpt}')
+        ckpt          = torch.load(auto_ckpt, map_location=device)
+        start_epoch   = ckpt['epoch'] + 1
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        print(f'Resumed from epoch {start_epoch - 1}. Best val loss so far: {best_val_loss:.4f}\n')
     else:
-        checkpoint    = torch.load(checkpoint, map_location=device)
-        start_epoch   = checkpoint['epoch'] + 1
-        print('\nLoaded checkpoint from epoch %d.\n' % start_epoch)
-        model         = checkpoint['model']
-        optimizer     = checkpoint['optimizer']
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        start_epoch = 0
+    # ─────────────────────────────────────────────────────────────────────
 
-    # Move to device
     model     = model.to(device)
     criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
 
-    # ── ReduceLROnPlateau scheduler ────────────────────────────────────
-    # Monitors val loss every epoch. If it doesn't improve for LR_PATIENCE
-    # epochs, lr is multiplied by factor=0.1.
-    # This replaces the old hardcoded decay_lr_at [80k, 100k] iterations —
-    # the lr now decays automatically whenever training plateaus, regardless
-    # of how many iterations have passed.
-    # min_lr=1e-6 prevents lr from shrinking to zero.
+    # ReduceLROnPlateau — reduces lr by ×0.1 when val loss plateaus for
+    # LR_PATIENCE epochs; min_lr=1e-6 prevents lr shrinking to zero.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',        # we want val loss to go DOWN
-        factor=0.1,        # multiply lr by 0.1 on plateau
-        patience=LR_PATIENCE,
-        min_lr=1e-6
+        optimizer, mode='min', factor=0.1, patience=LR_PATIENCE, min_lr=1e-6
     )
-    # ──────────────────────────────────────────────────────────────────
 
     # ── DataLoaders ────────────────────────────────────────────────────
     train_dataset = DIORDatasetSSD(DATA_DIR, split='trainval', split_file=TRAIN_INDICES, split_type='TRAIN')
@@ -143,30 +127,26 @@ def main():
     log_path = os.path.join(log_dir, 'loss_log.csv')
 
     csv_mode = 'a' if start_epoch > 0 else 'w'
-    log_file = open(log_path, csv_mode, newline='')
+    log_file   = open(log_path, csv_mode, newline='')
     csv_writer = csv.writer(log_file)
     if start_epoch == 0:
         csv_writer.writerow(['epoch', 'train_loss', 'val_loss', 'lr'])
     # ──────────────────────────────────────────────────────────────────
 
-    # ── Epoch loop ─────────────────────────────────────────────────────
     epoch_pbar = tqdm(range(start_epoch, MAX_EPOCHS),
                       desc=f'Training [{SPLIT}]',
                       unit='epoch')
 
     for epoch in epoch_pbar:
 
-        train_loss = train(train_loader, model, criterion, optimizer, epoch)
+        train_loss = train_one_epoch(train_loader, model, criterion, optimizer, epoch, start_epoch)
         val_loss   = validate(val_loader, model, criterion, epoch)
 
-        # Step the scheduler with the current val loss.
-        # If val loss hasn't improved for LR_PATIENCE epochs, lr is reduced.
         scheduler.step(val_loss)
 
-        # Current lr after scheduler step (for logging) — group 2 = head weights (base lr)
+        # group 2 = head weights — holds the "base" lr
         current_lr = optimizer.param_groups[2]['lr']
 
-        # Update epoch bar postfix
         epoch_pbar.set_postfix({
             'train': f'{train_loss:.4f}',
             'val':   f'{val_loss:.4f}',
@@ -174,28 +154,22 @@ def main():
             'lr':    f'{current_lr:.6f}'
         })
 
-        # Write to CSV
         csv_writer.writerow([epoch, f'{train_loss:.4f}', f'{val_loss:.4f}', f'{current_lr:.6f}'])
         log_file.flush()
 
-        # ── Checkpoint saving ──────────────────────────────────────────
         # Always save latest for crash recovery
         save_checkpoint(epoch, model, optimizer, SPLIT, 'checkpoint_latest.pth.tar', best_val_loss)
 
-        # Save periodic snapshot every 50 epochs for convergence study
+        # Periodic snapshot every 50 epochs for convergence study
         if epoch % 50 == 0:
             save_checkpoint(epoch, model, optimizer, SPLIT, f'checkpoint_epoch_{epoch:04d}.pth.tar', best_val_loss)
-        # ──────────────────────────────────────────────────────────────
 
         # ── Early stopping ─────────────────────────────────────────────
-        # Check if val loss improved by at least MIN_DELTA
         if val_loss < best_val_loss - MIN_DELTA:
-            # Improvement — reset counter, update best, save best checkpoint
             best_val_loss     = val_loss
             epochs_no_improve = 0
             save_checkpoint(epoch, model, optimizer, SPLIT, 'checkpoint_best.pth.tar', best_val_loss)
         else:
-            # No improvement — increment counter
             epochs_no_improve += 1
 
         if epochs_no_improve >= PATIENCE:
@@ -208,7 +182,7 @@ def main():
     log_file.close()
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train_one_epoch(train_loader, model, criterion, optimizer, epoch, start_epoch):
     """
     One epoch's training.
 
@@ -216,13 +190,13 @@ def train(train_loader, model, criterion, optimizer, epoch):
     :param model: model
     :param criterion: MultiBox loss
     :param optimizer: optimizer
-    :param epoch: epoch number
+    :param epoch: current epoch number
+    :param start_epoch: epoch training started from (0 = fresh, >0 = resumed)
     :return: average training loss for this epoch
     """
     model.train()
     # Freeze backbone BatchNorm layers: with batch_size=8 the mini-batch
-    # statistics are too noisy to keep BN in train mode — pretrained running
-    # stats are more reliable than per-batch estimates at this batch size.
+    # statistics are too noisy — pretrained running stats are more reliable.
     model.base.apply(_set_bn_eval)
 
     losses = AverageMeter()
@@ -238,8 +212,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     for i, (images, boxes, labels, _) in enumerate(batch_pbar):
 
         # Linear LR warmup — only on fresh training (start_epoch == 0).
-        # Skipped on resume to avoid overriding the scheduler-reduced LR that
-        # was saved in the checkpoint with the full initial lr.
+        # Skipped on resume to avoid overriding the scheduler-reduced LR.
         global_iter = epoch * len(train_loader) + i
         if start_epoch == 0 and global_iter < WARMUP_ITERS:
             scale = (global_iter + 1) / WARMUP_ITERS
@@ -275,11 +248,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
 def validate(val_loader, model, criterion, epoch):
     """
-    One epoch's validation.
-
-    During validation we do NOT update model weights — forward pass only.
-    model.eval() disables dropout and uses stable BatchNorm statistics.
-    torch.no_grad() skips building the computation graph to save memory.
+    One epoch's validation — forward pass only, no weight updates.
 
     :param val_loader: DataLoader for validation data
     :param model: model

@@ -517,7 +517,7 @@ def transform(image, boxes, labels, difficulties, split):
         new_image = FT.to_tensor(new_image)
 
         # Expand image (zoom out) with a 50% chance - helpful for training detection of small objects
-        # Fill surrounding space with the mean of ImageNet data that our base VGG was trained on
+        # Fill surrounding space with the mean of ImageNet data that our ResNet50 backbone was pretrained on
         if random.random() < 0.5:
             new_image, new_boxes = expand(new_image, boxes, filler=mean)
 
@@ -543,28 +543,18 @@ def transform(image, boxes, labels, difficulties, split):
     # Convert PIL image to Torch tensor
     new_image = FT.to_tensor(new_image)
 
-    # Normalize by mean and standard deviation of ImageNet data that our base VGG was trained on
+    # Normalize by mean and standard deviation of ImageNet data that our ResNet50 backbone was pretrained on
     new_image = FT.normalize(new_image, mean=mean, std=std)
 
     return new_image, new_boxes, new_labels, new_difficulties
 
 
-def adjust_learning_rate(optimizer, scale):
-    """
-    Scale learning rate by a specified factor.
-
-    :param optimizer: optimizer whose learning rate must be shrunk.
-    :param scale: factor to multiply learning rate with.
-    """
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = param_group['lr'] * scale
-    print("DECAYING learning rate.\n The new LR is %f\n" % (optimizer.param_groups[1]['lr'],))
-
-
-
 def save_checkpoint(epoch, model, optimizer, split_name, filename, best_val_loss=float('inf')):
     """
     Save model checkpoint to checkpoints/<split_name>/<filename>.
+
+    Saves state_dict (not the full model object) so checkpoints survive
+    refactors to model.py without becoming unloadable.
 
     :param epoch: epoch number
     :param model: model
@@ -575,7 +565,13 @@ def save_checkpoint(epoch, model, optimizer, split_name, filename, best_val_loss
     """
     folder = os.path.join('checkpoints', split_name)
     os.makedirs(folder, exist_ok=True)
-    state = {'epoch': epoch, 'model': model, 'optimizer': optimizer, 'best_val_loss': best_val_loss}
+    state = {
+        'epoch':                epoch,
+        'model_state_dict':     model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_loss':        best_val_loss,
+        'n_classes':            model.n_classes,
+    }
     torch.save(state, os.path.join(folder, filename))
 
 
