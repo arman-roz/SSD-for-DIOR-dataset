@@ -41,6 +41,11 @@ def _parse_xml(xml_path):
         ymin = float(bb.find('ymin').text)
         xmax = float(bb.find('xmax').text)
         ymax = float(bb.find('ymax').text)
+        # Skip degenerate boxes — zero width/height causes log(0)=-inf in
+        # cxcy_to_gcxgcy, which makes SmoothL1Loss return inf for that prior,
+        # collapsing the entire batch loss to inf.
+        if xmax <= xmin or ymax <= ymin:
+            continue
         boxes.append([xmin, ymin, xmax, ymax])
         labels.append(_CLASS_TO_IDX[name] + 1)   # 0-indexed → 1-indexed for SSD
     return boxes, labels
@@ -122,8 +127,10 @@ class DIORDatasetSSD(Dataset):
         else:
             boxes, labels = [], []
 
-        boxes = torch.FloatTensor(boxes)          # (N, 4) absolute pixel coords
-        labels = torch.LongTensor(labels)          # (N,)   1-indexed
+        # Use explicit shape (N,4) so an empty list gives (0,4) not (0,) —
+        # a 1-D empty tensor would crash find_jaccard_overlap in MultiBoxLoss.
+        boxes  = torch.FloatTensor(boxes).reshape(-1, 4)   # (N, 4) absolute pixel coords
+        labels = torch.LongTensor(labels)                   # (N,)   1-indexed
         difficulties = torch.zeros(len(labels), dtype=torch.uint8)  # (N,) all 0
 
         # transform() from utils.py:
