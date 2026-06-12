@@ -486,6 +486,11 @@ class MultiBoxLoss(nn.Module):
         for i in range(batch_size):
             n_objects = boxes[i].size(0)
 
+            if n_objects == 0:
+                # No ground-truth objects: all priors are background.
+                # true_classes[i] and true_locs[i] are already zero-initialised.
+                continue
+
             overlap = find_jaccard_overlap(boxes[i],
                                            self.priors_xy)  # (n_objects, 8732)
 
