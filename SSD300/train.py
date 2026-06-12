@@ -88,17 +88,19 @@ def main():
     auto_ckpt = os.path.join('checkpoints', SPLIT, 'checkpoint_latest.pth.tar')
     if os.path.exists(auto_ckpt):
         print(f'\nAuto-resuming from {auto_ckpt}')
-        ckpt          = torch.load(auto_ckpt, map_location=device)
-        start_epoch   = ckpt['epoch'] + 1
+        ckpt        = torch.load(auto_ckpt, map_location=device)
+        start_epoch = ckpt['epoch'] + 1
         model.load_state_dict(ckpt['model_state_dict'])
+        model = model.to(device)  # must precede optimizer.load_state_dict so that
+                                  # PyTorch casts momentum buffers to cuda, not cpu
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         print(f'Resumed from epoch {start_epoch - 1}. Best val loss so far: {best_val_loss:.4f}\n')
     else:
         start_epoch = 0
+        model = model.to(device)
     # ─────────────────────────────────────────────────────────────────────
 
-    model     = model.to(device)
     criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
 
     # ReduceLROnPlateau — reduces lr by ×0.1 when val loss plateaus for
