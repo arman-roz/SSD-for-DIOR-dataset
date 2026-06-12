@@ -321,6 +321,11 @@ def random_crop(image, boxes, labels, difficulties):
     """
     original_h = image.size(1)
     original_w = image.size(2)
+
+    # Nothing to crop around — return as-is
+    if boxes.numel() == 0:
+        return image, boxes, labels, difficulties
+
     # Keep choosing a minimum overlap until a successful crop is made
     while True:
         # Randomly draw the value for minimum overlap
