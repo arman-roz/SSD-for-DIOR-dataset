@@ -1,71 +1,103 @@
-from utils import *
-from datasets import PascalVOCDataset
+import os
+import csv
+import torch
+import torch.utils.data
 from tqdm import tqdm
 from pprint import PrettyPrinter
 
-# Good formatting when printing the APs for each class and mAP
+from utils import calculate_mAP, label_map, rev_label_map
+from datasets import DIORDataset
+from model import SSD300
+
 pp = PrettyPrinter()
 
-# Parameters
-data_folder = './'
-keep_difficult = True  # difficult ground truth objects must always be considered in mAP calculation, because these objects DO exist!
-batch_size = 64
-workers = 4
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-checkpoint = './checkpoint_ssd300.pth.tar'
+# ── paths ─────────────────────────────────────────────────────────────────────
+DATA_DIR       = os.path.expanduser('~/Arman/data')
+CHECKPOINT_DIR = './checkpoints'      # train.py saves one sub-folder per split
+RESULTS_CSV    = './eval_results.csv' # summary table written after all splits
 
-# Load model checkpoint that is to be evaluated
-checkpoint = torch.load(checkpoint)
-model = checkpoint['model']
-model = model.to(device)
+SPLITS = ['split_005', 'split_025', 'split_050', 'split_075', 'split_100']
 
-# Switch to eval mode
-model.eval()
+# ── eval settings (standard VOC protocol — same as YOLO eval) ─────────────────
+MIN_SCORE   = 0.01
+MAX_OVERLAP = 0.45
+TOP_K       = 200
+BATCH_SIZE  = 8
+WORKERS     = 4
 
-# Load test data
-test_dataset = PascalVOCDataset(data_folder,
-                                split='test',
-                                keep_difficult=keep_difficult)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                                          collate_fn=test_dataset.collate_fn, num_workers=workers, pin_memory=True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def evaluate(test_loader, model):
+# ── test dataset — 11,738 fully annotated images ──────────────────────────────
+# The DIOR test set (JPEGImages-test/, IDs 11726–23463) has annotation XML
+# files in the same Annotations/Horizontal Bounding Boxes/ folder as trainval.
+# This is the proper held-out evaluation set.
+#
+# Note: YOLO reported metrics on the val split during training.
+# For the final comparison table we evaluate SSD on the full test set which
+# is a stronger and fairer holdout. Val evaluation is also supported — see
+# the comment in run_all() below.
+test_dataset = DIORDataset(
+    data_dir   = DATA_DIR,
+    split      = 'test',    # reads test.txt, images in JPEGImages-test/
+    split_file = None,      # always the full 11,738-image test set
+    split_name = 'TEST',    # no augmentation
+)
+test_loader = torch.utils.data.DataLoader(
+    test_dataset,
+    batch_size  = BATCH_SIZE,
+    shuffle     = False,
+    collate_fn  = DIORDataset.collate_fn,
+    num_workers = WORKERS,
+    pin_memory  = True,
+)
+
+
+def evaluate_split(split_name, loader):
     """
-    Evaluate.
+    Load the checkpoint for one split and evaluate on the provided loader.
 
-    :param test_loader: DataLoader for test data
-    :param model: model
+    Returns:
+        APs  : dict  {class_name: AP_value}
+        mAP  : float
     """
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, split_name, 'best_ssd300.pth.tar')
 
-    # Make sure it's in eval mode
+    if not os.path.exists(checkpoint_path):
+        print(f'[SKIP] No checkpoint found for {split_name} at {checkpoint_path}')
+        return None, None
+
+    print(f'\n{"="*60}')
+    print(f'Evaluating : {split_name}')
+    print(f'Checkpoint : {checkpoint_path}')
+    print(f'{"="*60}')
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model      = SSD300(n_classes=len(label_map))
+    model.load_state_dict(checkpoint['model'])
+    model      = model.to(device)
     model.eval()
 
-    # Lists to store detected and true boxes, labels, scores
-    det_boxes = list()
-    det_labels = list()
-    det_scores = list()
-    true_boxes = list()
-    true_labels = list()
-    true_difficulties = list()  # it is necessary to know which objects are 'difficult', see 'calculate_mAP' in utils.py
+    det_boxes       = []
+    det_labels      = []
+    det_scores      = []
+    true_boxes      = []
+    true_labels     = []
+    true_difficulties = []
 
     with torch.no_grad():
-        # Batches
-        for i, (images, boxes, labels, difficulties) in enumerate(tqdm(test_loader, desc='Evaluating')):
-            images = images.to(device)  # (N, 3, 300, 300)
+        for images, boxes, labels, difficulties in tqdm(loader, desc='  Inferring'):
+            images = images.to(device)
 
-            # Forward prop.
             predicted_locs, predicted_scores = model(images)
 
-            # Detect objects in SSD output
-            det_boxes_batch, det_labels_batch, det_scores_batch = model.detect_objects(predicted_locs, predicted_scores,
-                                                                                       min_score=0.01, max_overlap=0.45,
-                                                                                       top_k=200)
-            # Evaluation MUST be at min_score=0.01, max_overlap=0.45, top_k=200 for fair comparision with the paper's results and other repos
+            det_boxes_batch, det_labels_batch, det_scores_batch = model.detect_objects(
+                predicted_locs, predicted_scores,
+                min_score=MIN_SCORE, max_overlap=MAX_OVERLAP, top_k=TOP_K,
+            )
 
-            # Store this batch's results for mAP calculation
-            boxes = [b.to(device) for b in boxes]
-            labels = [l.to(device) for l in labels]
+            boxes        = [b.to(device) for b in boxes]
+            labels       = [l.to(device) for l in labels]
             difficulties = [d.to(device) for d in difficulties]
 
             det_boxes.extend(det_boxes_batch)
@@ -75,14 +107,76 @@ def evaluate(test_loader, model):
             true_labels.extend(labels)
             true_difficulties.extend(difficulties)
 
-        # Calculate mAP
-        APs, mAP = calculate_mAP(det_boxes, det_labels, det_scores, true_boxes, true_labels, true_difficulties)
+    APs, mAP = calculate_mAP(
+        det_boxes, det_labels, det_scores,
+        true_boxes, true_labels, true_difficulties,
+    )
 
-    # Print AP for each class
+    print(f'\n  Per-class AP:')
     pp.pprint(APs)
+    print(f'\n  mAP@0.50 : {mAP:.4f}')
 
-    print('\nMean Average Precision (mAP): %.3f' % mAP)
+    return APs, mAP
+
+
+def run_all():
+    """
+    Evaluate every split that has a saved checkpoint and write a CSV summary.
+
+    To evaluate on the val split instead of the test split (e.g. to compare
+    directly with YOLO's per-epoch val metrics), swap test_loader for:
+
+        val_dataset = DIORDataset(DATA_DIR, split='val', split_file=None, split_name='TEST')
+        val_loader  = torch.utils.data.DataLoader(val_dataset, ...)
+
+    and pass val_loader to evaluate_split().
+    """
+    class_names = [rev_label_map[i] for i in range(1, len(label_map))]
+
+    # Actual training-set sizes after the leakage fix (train.txt only, 5,862 images).
+    # Old values (586 / 2931 / 5862 / 8793 / 11725) were based on the 11,725-image
+    # train+val pool and are now wrong.
+    split_image_counts = {
+        'split_005':  293,   # int(0.05 * 5862)
+        'split_025': 1465,   # int(0.25 * 5862)
+        'split_050': 2931,   # int(0.50 * 5862)
+        'split_075': 4396,   # int(0.75 * 5862)
+        'split_100': 5862,   # 100% of train.txt
+    }
+
+    rows = []
+    for split in SPLITS:
+        APs, mAP = evaluate_split(split, test_loader)
+        if APs is None:
+            continue
+        row = {
+            'split'   : split,
+            'n_images': split_image_counts[split],
+            'mAP'     : round(mAP, 4),
+        }
+        for cls in class_names:
+            row[cls] = round(APs.get(cls, 0.0), 4)
+        rows.append(row)
+
+    if not rows:
+        print('\nNo checkpoints found. Train at least one split first.')
+        return
+
+    # Write CSV summary
+    fieldnames = ['split', 'n_images', 'mAP'] + class_names
+    with open(RESULTS_CSV, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f'\nResults saved to {RESULTS_CSV}')
+
+    # Print summary table
+    print(f'\n{"split":<12} {"images":>8} {"mAP":>8}')
+    print('-' * 32)
+    for row in rows:
+        print(f'{row["split"]:<12} {row["n_images"]:>8} {row["mAP"]:>8.4f}')
 
 
 if __name__ == '__main__':
-    evaluate(test_loader, model)
+    run_all()
